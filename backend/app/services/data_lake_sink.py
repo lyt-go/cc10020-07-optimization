@@ -3,16 +3,30 @@
 将接入的数据按日期/来源/类型分区写入本地JSON文件，
 支持多种写入格式和压缩策略。
 跨模块关联：webhook_channel（事件来源）、batch_ingest（批量来源）、event_archive（归档接口）。
+
+分区目录形如 ``data_store/lake/events/<事件类型>/<年/月/日>``，单条事件
+文件（dict）与批次数组文件（list）混存。跨分区检索统一走
+``app.lake_scan.LakeReader`` 的快照分页，本服务只负责写入与对外封装。
 """
 from __future__ import annotations
 
 import hashlib
 import json
 import os
-import zlib
-from datetime import datetime, timezone
+import tempfile
+from datetime import date, datetime, timezone
 from typing import Any
 
+from app.lake_scan import (
+    LakeFilter,
+    LakeReader,
+    decode_cursor,
+    default_lake_base,
+    list_partition_days,
+    make_filter,
+    partition_of,
+    read_partition,
+)
 from app.persistence import json_store
 from app.services.base import BaseModuleService
 
@@ -27,60 +41,85 @@ class DataLakeSinkService(BaseModuleService):
     ACTION_RULES = {"提交校验": "待校验", "标记生效": "已生效", "停用配置": "已停用"}
     NEGATIVE_ACTIONS = ["停用配置"]
 
-    def __init__(self) -> None:
+    def __init__(self, lake_base: str | None = None) -> None:
         super().__init__()
-        self._lake_base = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "data_store", "lake")
+        self._lake_base = lake_base or default_lake_base()
         os.makedirs(self._lake_base, exist_ok=True)
         self._write_stats: dict[str, int] = {}
 
+    # ──────────────────────────────────────────────────────────
+    # 读取器：跨分区快照分页（查询与归档共用同一取数口径）
+    # ──────────────────────────────────────────────────────────
+    def _reader(self) -> LakeReader:
+        return LakeReader(lake_base=self._lake_base, store=json_store)
+
+    # ──────────────────────────────────────────────────────────
+    # 写入
+    # ──────────────────────────────────────────────────────────
+    def _partition_path(self, event_type: str, day: date) -> str:
+        partition = partition_of(event_type, day)
+        path = os.path.join(self._lake_base, *partition.split("/"))
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    @staticmethod
+    def _atomic_dump(path: str, data: Any) -> None:
+        """同目录临时文件 + 原子 rename，避免并发落湖产生半截文件。"""
+        directory = os.path.dirname(path)
+        fd, tmp_path = tempfile.mkstemp(prefix=".lake_", suffix=".tmp", dir=directory)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
+                json.dump(data, fh, ensure_ascii=False, default=str)
+            os.replace(tmp_path, path)
+        except OSError:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+            raise
+
     def write_event(self, event_id: str, event_type: str, payload: dict[str, Any],
-                    source_channel_id: int = 0) -> dict[str, Any]:
+                    source_channel_id: int = 0,
+                    event_day: date | str | None = None) -> dict[str, Any]:
         """将事件数据写入数据湖。
 
         写入流程：
-        1. 确定分区路径（按日期/事件类型）
-        2. 序列化数据（默认JSON格式）
-        3. 写入分区文件
+        1. 确定分区路径（按日期/事件类型）；``event_day`` 用于迟到事件，
+           可把同一天迟到的事件显式写入前一日分区
+        2. 序列化数据（默认JSON格式，单条事件文件）
+        3. 原子写入分区文件
         4. 更新写入统计
 
-        Args:
-            event_id: 事件唯一标识
-            event_type: 事件类型
-            payload: 事件数据
-            source_channel_id: 来源通道ID
-
         Returns:
-            { ok: bool, message: str, partition: str, file_path: str }
+            { ok, message, partition, file_path, record_hash }
         """
         now = datetime.now(timezone.utc)
-        date_partition = now.strftime("%Y/%m/%d")
-        partition_path = os.path.join(self._lake_base, f"events/{event_type}", date_partition)
-        os.makedirs(partition_path, exist_ok=True)
+        day = self._coerce_day(event_day, now)
+        partition_path = self._partition_path(event_type, day)
+        date_partition = day.strftime("%Y/%m/%d")
 
-        # 构建数据记录
         record = {
             "event_id": event_id,
             "event_type": event_type,
             "source_channel_id": source_channel_id,
             "payload": payload,
             "ingested_at": now.isoformat(),
-            "record_hash": hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16],
+            "event_day": day.isoformat(),
+            "record_hash": hashlib.sha256(
+                json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()
+            ).hexdigest()[:16],
         }
 
-        # 写入分区文件
-        file_name = f"{now.strftime('%H%M%S')}_{event_id[:8]}.json"
+        # 微秒+随机后缀避免并发落湖时文件名冲突。
+        suffix = hashlib.sha1(os.urandom(6)).hexdigest()[:6]
+        file_name = f"{now.strftime('%H%M%S%f')}_{event_id[:8]}_{suffix}.json"
         file_path = os.path.join(partition_path, file_name)
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(record, f, ensure_ascii=False, default=str)
-
+            self._atomic_dump(file_path, record)
             self._write_stats[event_type] = self._write_stats.get(event_type, 0) + 1
-
             return {
                 "ok": True,
                 "message": f"数据已写入数据湖分区 {date_partition}",
-                "partition": f"events/{event_type}/{date_partition}",
+                "partition": partition_of(event_type, day),
                 "file_path": file_path,
                 "record_hash": record["record_hash"],
             }
@@ -88,79 +127,152 @@ class DataLakeSinkService(BaseModuleService):
             return {"ok": False, "message": f"写入失败: {e}", "partition": "", "file_path": ""}
 
     def write_batch(self, records: list[dict[str, Any]], event_type: str = "batch",
-                    source_channel_id: int = 0) -> dict[str, Any]:
-        """批量写入多条记录到数据湖。
+                    source_channel_id: int = 0,
+                    event_day: date | str | None = None) -> dict[str, Any]:
+        """批量写入多条记录到数据湖（批次数组文件，按写入时刻聚合成文件）。
 
-        按每小时一个文件聚合写入。
+        ``event_day`` 支持把批次写入历史/前一日分区，与单条事件文件混存
+        在同一分区，由跨分区读取器统一展开。
         """
         if not records:
             return {"ok": True, "message": "无数据需要写入", "written": 0}
 
         now = datetime.now(timezone.utc)
-        date_partition = now.strftime("%Y/%m/%d")
-        partition_path = os.path.join(self._lake_base, f"events/{event_type}", date_partition)
-        os.makedirs(partition_path, exist_ok=True)
+        day = self._coerce_day(event_day, now)
+        partition_path = self._partition_path(event_type, day)
 
-        batch_file = f"batch_{now.strftime('%H%M%S')}.json"
+        batch_file = f"batch_{now.strftime('%H%M%S%f')}.json"
         file_path = os.path.join(partition_path, batch_file)
 
         batch_records = []
         for i, record in enumerate(records):
             batch_records.append({
-                "event_id": f"batch_{now.strftime('%Y%m%d%H%M%S')}_{i:04d}",
+                "event_id": f"batch_{now.strftime('%Y%m%d%H%M%S%f')}_{i:04d}",
                 "event_type": event_type,
                 "source_channel_id": source_channel_id,
                 "payload": record,
                 "ingested_at": now.isoformat(),
+                "event_day": day.isoformat(),
             })
 
         try:
-            with open(file_path, "w", encoding="utf-8") as f:
-                json.dump(batch_records, f, ensure_ascii=False, default=str)
-
+            self._atomic_dump(file_path, batch_records)
             self._write_stats[event_type] = self._write_stats.get(event_type, 0) + len(batch_records)
-
             return {
                 "ok": True,
                 "message": f"批量 {len(batch_records)} 条写入完成",
                 "written": len(batch_records),
-                "partition": f"events/{event_type}/{date_partition}",
+                "partition": partition_of(event_type, day),
                 "file_path": file_path,
             }
         except OSError as e:
             return {"ok": False, "message": f"批量写入失败: {e}", "written": 0}
 
+    @staticmethod
+    def _coerce_day(value: date | str | None, now: datetime) -> date:
+        if value is None:
+            return now.date()
+        if isinstance(value, date):
+            return value
+        for fmt in ("%Y/%m/%d", "%Y-%m-%d"):
+            try:
+                return datetime.strptime(value.strip(), fmt).date()
+            except ValueError:
+                continue
+        return now.date()
+
+    # ──────────────────────────────────────────────────────────
+    # 查询：跨分区快照分页
+    # ──────────────────────────────────────────────────────────
+    def build_filter(self, **kwargs: Any) -> LakeFilter:
+        """对外暴露统一筛选口径，归档候选生成复用同一入口。"""
+        return make_filter(**kwargs)
+
+    def query_lake_pages(self, event_type: str | None = None,
+                         start_day: str | None = None, end_day: str | None = None,
+                         *, size: int = 20, cursor: str | None = None,
+                         keyword: str | None = None,
+                         source_channel_id: int | None = None,
+                         event_ids: list[str] | set[str] | None = None,
+                         extra_filters: dict[str, Any] | None = None,
+                         query_scope: str | None = None) -> dict[str, Any]:
+        """跨分区检索落湖记录，分页按事件顺序组成跨分区数据页。
+
+        - 首屏（无 cursor）：扫描日期范围内全部分区，展开单条文件与批次
+          数组，排序后冻结为快照，返回第一页与 next_cursor；
+        - 翻页（带 cursor）：只从快照切片，并发落湖的新记录不会进入后续
+          分页，后续分页只交付快照内尚未交付的记录；
+        - 每条事件带 ``_lake`` 分区来源与读取边界。
+        """
+        reader = self._reader()
+        size = max(1, min(int(size), 500))
+
+        if cursor:
+            snapshot_id, offset = decode_cursor(cursor)
+            page = reader.page_snapshot(snapshot_id, offset, size)
+            page["ok"] = True
+            return page
+
+        lake_filter = make_filter(
+            event_type=event_type,
+            start_day=start_day,
+            end_day=end_day,
+            keyword=keyword,
+            source_channel_id=source_channel_id,
+            event_ids=set(event_ids) if event_ids else None,
+            extra=extra_filters or {},
+        )
+        page = reader.first_page(lake_filter, size=size, query_scope=query_scope)
+        page["ok"] = True
+        return page
+
+    def get_query_snapshot(self, snapshot_id: str) -> dict[str, Any] | None:
+        """按快照 ID 回查一次跨分区查询的冻结范围、分区版本与全量记录。"""
+        return self._reader().get_snapshot(snapshot_id)
+
+    def find_query_record(self, snapshot_id: str, sequence: int) -> dict[str, Any] | None:
+        """按 (快照, 跨分区序号) 定位某条归档候选对应的查询记录。"""
+        snapshot = self.get_query_snapshot(snapshot_id)
+        if snapshot is None:
+            return None
+        for record in snapshot.get("records", []):
+            lake = record.get("_lake", {})
+            if lake.get("sequence") == sequence:
+                return record
+        return None
+
+    def get_partition_versions(self, event_type: str | None = None) -> list[dict[str, Any]]:
+        """分区版本清单：历史分区按文件清单指纹稳定回查。"""
+        reader = self._reader()
+        if event_type is None:
+            return reader.partition_versions()
+        partitions = [partition_of(event_type, day)
+                      for day in list_partition_days(self._lake_base, event_type)]
+        return reader.partition_versions(partitions)
+
+    # ──────────────────────────────────────────────────────────
+    # 兼容旧接口：保留按天读取，但底层改为统一展开逻辑
+    # ──────────────────────────────────────────────────────────
     def query_lake_data(self, event_type: str, date_str: str | None = None,
                         limit: int = 100) -> dict[str, Any]:
-        """查询数据湖中的指定分区数据。"""
+        """查询数据湖中的指定分区数据（旧接口，按天单分区）。"""
         if date_str is None:
             date_str = datetime.now(timezone.utc).strftime("%Y/%m/%d")
 
-        partition_path = os.path.join(self._lake_base, f"events/{event_type}", date_str)
-
-        if not os.path.exists(partition_path):
-            return {"ok": True, "records": [], "total": 0, "partition": f"events/{event_type}/{date_str}"}
-
-        records = []
-        for fname in sorted(os.listdir(partition_path))[:limit]:
-            if fname.endswith(".json"):
-                try:
-                    with open(os.path.join(partition_path, fname), "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                        if isinstance(data, list):
-                            records.extend(data)
-                        else:
-                            records.append(data)
-                except (json.JSONDecodeError, OSError):
-                    continue
+        partition = partition_of(event_type, self._coerce_day(date_str, datetime.now(timezone.utc)))
+        records, version = read_partition(self._lake_base, partition)
 
         return {
             "ok": True,
             "records": records[:limit],
             "total": len(records),
-            "partition": f"events/{event_type}/{date_str}",
+            "partition": partition,
+            "partition_version": version,
         }
 
+    # ──────────────────────────────────────────────────────────
+    # 统计
+    # ──────────────────────────────────────────────────────────
     def get_lake_stats(self) -> dict[str, Any]:
         """获取数据湖存储统计信息。"""
         total_files = 0
@@ -177,7 +289,6 @@ class DataLakeSinkService(BaseModuleService):
                     except OSError:
                         pass
 
-                # 按事件类型统计
                 parts = root.split(os.sep)
                 if "events" in parts:
                     idx = parts.index("events")

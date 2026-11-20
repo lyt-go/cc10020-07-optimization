@@ -77,5 +77,38 @@ npm run dev
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
 
+## 落湖跨分区检索与归档候选
+
+落湖目录按 `data_store/lake/events/<事件类型>/<年/月/日>` 分区，单条事件文件
+（dict）与批次数组文件（list）混存。`backend/app/lake_scan.py` 把扫描、展开、
+排序、分页固化为数据落湖查询与事件归档清理共用的取数口径：
+
+- **跨分区事件顺序分页**：统一展开两种文件，按「分区日 → 来源文件 → 批次内序号」
+  排序，分页边界可跨越单条文件、批次数组和日分区，游标为不透明 base64 token。
+- **快照隔离并发落湖**：首屏查询冻结一份只读快照（含分区版本与全量记录坐标），
+  后续翻页只从快照切片，并发落湖的新记录只出现在新快照，后续分页只交付新记录。
+- **分区来源与读取边界**：每条事件带 `_lake`（分区、来源文件、文件布局、批次序号、
+  分区版本、快照 ID、跨分区序号），分区版本由文件清单（文件名+大小+mtime）指纹
+  得到，历史分区文件不变则版本稳定、可随时回查。
+- **迟到事件**：`write_event/write_batch` 支持 `event_day`，同一天迟到的事件可
+  显式写入前一日分区，仍落在同一次查询范围内。
+- **归档候选共用筛选口径**：`EventArchiveService.build_archive_filter` 与查询共用
+  `LakeFilter`；候选从跨分区查询数据页逐页读取的有效记录中筛选，每个候选带快照 ID
+  与序号，可回查到对应查询记录；归档执行历史持久化、按 `run_id` 回查。
+
+### 管道端点
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/api/pipeline/lake/query` | 跨分区检索，首屏建快照、翻页带 `cursor` |
+| GET | `/api/pipeline/lake/snapshots/{snapshot_id}` | 回查快照冻结范围、分区版本与全量记录 |
+| GET | `/api/pipeline/lake/snapshots/{snapshot_id}/records/{sequence}` | 按序号定位候选对应的查询记录 |
+| GET | `/api/pipeline/lake/partition-versions` | 分区版本清单（兼容历史分区） |
+| POST | `/api/pipeline/archive/candidates` | 按策略生成归档候选（共用筛选口径） |
+| GET | `/api/pipeline/archive/runs` / `/api/pipeline/archive/runs/{run_id}` | 归档执行历史回查 |
+
+前端在「数据落湖」工作台内嵌跨分区检索面板，在「事件归档清理」工作台内嵌归档
+候选面板（`frontend/src/views/lake/`），候选可一键回查其查询记录与读取边界。
+
 领域：数据工程
 子方向：数据采集、爬虫与RPA

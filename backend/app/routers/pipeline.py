@@ -48,6 +48,23 @@ class ValidationRequest(BaseModel):
     source_module: str = ""
 
 
+class LakeQueryRequest(BaseModel):
+    event_type: str | None = None
+    start_day: str | None = None
+    end_day: str | None = None
+    size: int = 20
+    cursor: str | None = None
+    keyword: str | None = None
+    source_channel_id: int | None = None
+    event_ids: list[str] | None = None
+    extra_filters: dict[str, Any] | None = None
+
+
+class ArchiveCandidateRequest(BaseModel):
+    policy_id: int
+    page_size: int = 200
+
+
 @router.post("/webhook-to-lake")
 def pipeline_webhook_to_lake(channel_id: int, payload: WebhookPayload) -> dict[str, Any]:
     """链路1: Webhook接收 → 事件解析 → 去重 → 分发路由 → 数据落湖。
@@ -172,3 +189,92 @@ def pipeline_archive_execute(policy_id: int) -> dict[str, Any]:
     from app.services.event_archive import EventArchiveService
     svc = EventArchiveService()
     return svc.execute_archive(policy_id=policy_id)
+
+
+@router.post("/lake/query")
+def pipeline_lake_query(request: LakeQueryRequest) -> dict[str, Any]:
+    """跨分区落湖检索：按事件顺序组成跨分区数据页。
+
+    首屏无 cursor 时冻结查询快照，翻页携带上一页返回的 next_cursor；
+    并发落湖的新记录只出现在新的查询快照里，不影响后续分页。
+    """
+    from app.services.data_lake_sink import DataLakeSinkService
+    svc = DataLakeSinkService()
+    try:
+        return svc.query_lake_pages(
+            event_type=request.event_type,
+            start_day=request.start_day,
+            end_day=request.end_day,
+            size=request.size,
+            cursor=request.cursor,
+            keyword=request.keyword,
+            source_channel_id=request.source_channel_id,
+            event_ids=request.event_ids,
+            extra_filters=request.extra_filters,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc).strip("'")) from exc
+
+
+@router.get("/lake/snapshots/{snapshot_id}")
+def pipeline_lake_snapshot(snapshot_id: str) -> dict[str, Any]:
+    """回查一次跨分区查询的冻结范围、分区版本与全量记录。"""
+    from app.services.data_lake_sink import DataLakeSinkService
+    svc = DataLakeSinkService()
+    snapshot = svc.get_query_snapshot(snapshot_id)
+    if snapshot is None:
+        raise HTTPException(status_code=404, detail=f"查询快照 {snapshot_id} 不存在或已过期")
+    return snapshot
+
+
+@router.get("/lake/snapshots/{snapshot_id}/records/{sequence}")
+def pipeline_lake_snapshot_record(snapshot_id: str, sequence: int) -> dict[str, Any]:
+    """按跨分区序号定位归档候选对应的查询记录。"""
+    from app.services.data_lake_sink import DataLakeSinkService
+    svc = DataLakeSinkService()
+    record = svc.find_query_record(snapshot_id, sequence)
+    if record is None:
+        raise HTTPException(status_code=404, detail="查询记录不存在或快照已过期")
+    return record
+
+
+@router.get("/lake/partition-versions")
+def pipeline_lake_partition_versions(event_type: str | None = None) -> dict[str, Any]:
+    """分区版本清单：历史分区按文件清单指纹稳定回查。"""
+    from app.services.data_lake_sink import DataLakeSinkService
+    svc = DataLakeSinkService()
+    return {"ok": True, "partitions": svc.get_partition_versions(event_type)}
+
+
+@router.post("/archive/candidates")
+def pipeline_archive_candidates(request: ArchiveCandidateRequest) -> dict[str, Any]:
+    """归档候选：与查询共用筛选口径，从跨分区查询数据页读取有效记录。"""
+    from app.persistence import json_store
+    from app.services.event_archive import EventArchiveService
+    policy = json_store.get_by_id("event_archive", request.policy_id)
+    if policy is None:
+        raise HTTPException(status_code=404, detail=f"归档策略 {request.policy_id} 不存在")
+    svc = EventArchiveService()
+    return svc.collect_archive_candidates(policy, page_size=request.page_size)
+
+
+@router.get("/archive/runs")
+def pipeline_archive_runs() -> dict[str, Any]:
+    """回查归档执行历史（含快照 ID、分区版本与来源文件坐标）。"""
+    from app.services.event_archive import EventArchiveService
+    svc = EventArchiveService()
+    runs = svc.list_archive_runs()
+    return {"ok": True, "total": len(runs), "runs": runs}
+
+
+@router.get("/archive/runs/{run_id}")
+def pipeline_archive_run_detail(run_id: str) -> dict[str, Any]:
+    """回查单次归档执行记录。"""
+    from app.services.event_archive import EventArchiveService
+    svc = EventArchiveService()
+    run = svc.get_archive_run(run_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail=f"归档执行记录 {run_id} 不存在")
+    return run

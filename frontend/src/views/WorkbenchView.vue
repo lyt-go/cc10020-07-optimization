@@ -28,6 +28,9 @@
       </span>
     </p>
 
+    <LakeQueryPanel v-if="meta.key === 'data_lake_sink'" />
+    <ArchiveCandidatePanel v-if="meta.key === 'event_archive'" />
+
     <form class="filter-bar" @submit.prevent="reload">
       <label v-for="field in filterFields" :key="field" class="filter-item">
         <span>{{ field }}</span>
@@ -104,6 +107,8 @@ import {
   runAction as applyAction,
 } from '@/api/backend-service'
 import type { EntryRow } from '@/data/types'
+import LakeQueryPanel from '@/views/lake/LakeQueryPanel.vue'
+import ArchiveCandidatePanel from '@/views/lake/ArchiveCandidatePanel.vue'
 
 const props = defineProps<{ moduleKey: string }>()
 const meta = moduleMeta(props.moduleKey)
